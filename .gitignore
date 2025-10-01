@@ -13,3 +13,5 @@ venv/
 .venv/
 *.env
 *.egg-info/
+*.csv
+*.pkl
