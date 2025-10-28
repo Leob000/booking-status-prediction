@@ -19,6 +19,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
+from xgboost import XGBClassifier
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -177,7 +178,7 @@ def build_pipeline(
         include_week_number_8to10_flag=True,
     )
 
-    if model_type == "histgb":
+    if model_type in {"histgb", "xgboost"}:
         numeric_processor = Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="median")),
@@ -211,14 +212,31 @@ def build_pipeline(
             remainder="drop",
         )
 
-        classifier = HistGradientBoostingClassifier(
-            learning_rate=0.05,
-            max_iter=400,
-            max_leaf_nodes=31,
-            min_samples_leaf=25,
-            l2_regularization=1.0,
-            random_state=random_state,
-        )
+        if model_type == "histgb":
+            classifier = HistGradientBoostingClassifier(
+                learning_rate=0.05,
+                max_iter=400,
+                max_leaf_nodes=31,
+                min_samples_leaf=25,
+                l2_regularization=1.0,
+                random_state=random_state,
+            )
+        else:
+            classifier = XGBClassifier(
+                n_estimators=600,
+                learning_rate=0.05,
+                max_depth=8,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                min_child_weight=3,
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                tree_method="hist",
+                n_jobs=-1,
+                random_state=random_state,
+                verbosity=0,
+            )
 
         return Pipeline(
             steps=[
@@ -247,7 +265,7 @@ def build_pipeline(
         )
 
     raise ValueError(
-        f"Unsupported model type '{model_type}'. Choose 'histgb' or 'catboost'."
+        f"Unsupported model type '{model_type}'. Choose 'histgb', 'catboost', or 'xgboost'."
     )
 
 
@@ -365,7 +383,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        choices=["histgb", "catboost"],
+        choices=["histgb", "catboost", "xgboost"],
         default="catboost",
         help="Which classifier to train (default: catboost).",
     )
