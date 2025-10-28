@@ -15,7 +15,7 @@ from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
@@ -269,6 +269,75 @@ def build_pipeline(
     )
 
 
+def get_param_distributions(model_type: str) -> Dict[str, Sequence[Any]]:
+    if model_type == "histgb":
+        return {
+            "classifier__learning_rate": [0.03, 0.1],
+            "classifier__max_iter": [250, 550],
+            "classifier__max_leaf_nodes": [31, 127],
+            "classifier__min_samples_leaf": [15, 40],
+            "classifier__l2_regularization": [0.0, 1.0],
+        }
+    if model_type == "catboost":
+        return {
+            "classifier__iterations": [800, 1600],
+            "classifier__learning_rate": [0.03, 0.08],
+            "classifier__depth": [6, 10],
+            "classifier__l2_leaf_reg": [2.0, 5.0],
+        }
+    if model_type == "xgboost":
+        return {
+            "classifier__n_estimators": [400, 600],
+            "classifier__learning_rate": [0.03, 0.08],
+            "classifier__max_depth": [6, 10],
+            "classifier__subsample": [0.7, 0.9],
+            "classifier__colsample_bytree": [0.7, 0.9],
+            "classifier__reg_lambda": [0.5, 1.5],
+            "classifier__min_child_weight": [1, 5],
+        }
+    return {}
+
+
+def run_hyperparameter_search(
+    *,
+    estimator: Pipeline,
+    param_distributions: Dict[str, Sequence[Any]],
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_iter: int,
+    cv_splits: int,
+    random_state: int,
+    n_jobs: int | None,
+    sample_weight: np.ndarray | None,
+) -> Dict[str, Any]:
+    """Run a randomized hyperparameter search and return the best configuration."""
+    stratified_cv = StratifiedKFold(
+        n_splits=cv_splits, shuffle=True, random_state=random_state
+    )
+
+    search = RandomizedSearchCV(
+        estimator=estimator,
+        param_distributions=param_distributions,
+        n_iter=n_iter,
+        scoring="f1_weighted",
+        cv=stratified_cv,
+        random_state=random_state,
+        n_jobs=n_jobs,
+        refit=True,
+        return_train_score=False,
+    )
+
+    fit_kwargs: Dict[str, Any] = {}
+    if sample_weight is not None:
+        fit_kwargs["classifier__sample_weight"] = sample_weight
+
+    search.fit(X, y, **fit_kwargs)
+    return {
+        "best_params": search.best_params_,
+        "best_score": float(search.best_score_),
+    }
+
+
 def run_cross_validation(
     pipeline_builder,
     X: pd.DataFrame,
@@ -378,14 +447,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--random-state",
         type=int,
-        default=42,
+        default=3,
         help="Random seed for reproducibility (default: 42).",
     )
     parser.add_argument(
         "--model",
         choices=["histgb", "catboost", "xgboost"],
-        default="catboost",
+        default="xgboost",
         help="Which classifier to train (default: catboost).",
+    )
+    parser.add_argument(
+        "--search",
+        action="store_true",
+        help="Enable randomized hyperparameter search before cross-validation.",
+    )
+    parser.add_argument(
+        "--search-iterations",
+        type=int,
+        default=15,
+        help="Number of parameter settings sampled during search (default: 15).",
+    )
+    parser.add_argument(
+        "--search-n-splits",
+        type=int,
+        default=5,
+        help="Number of CV folds used during hyperparameter search (default: --n-splits).",
+    )
+    parser.add_argument(
+        "--search-n-jobs",
+        type=int,
+        default=-1,
+        help="Parallel jobs for hyperparameter search (-1 uses all cores, default: 1).",
     )
     parser.add_argument(
         "--metrics-path",
@@ -422,16 +514,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     X = df.drop(columns=[args.target_column])
     y = df[args.target_column]
 
-    def pipeline_builder() -> Pipeline:
-        return build_pipeline(
-            random_state=args.random_state,
-            model_type=args.model,
-        )
-
-    probe_pipeline = pipeline_builder()
-    features_step = probe_pipeline.named_steps.get("features")
+    base_pipeline = build_pipeline(
+        random_state=args.random_state,
+        model_type=args.model,
+    )
+    features_step = base_pipeline.named_steps.get("features")
     removed_outliers = 0
-    if isinstance(features_step, DataFrameTransformer) and features_step.drop_adr_outliers:
+    if (
+        isinstance(features_step, DataFrameTransformer)
+        and features_step.drop_adr_outliers
+    ):
         upper_bound = getattr(features_step, "adr_upper_bound", None)
         if upper_bound is not None:
             X, y, removed_outliers = _drop_adr_outliers(
@@ -443,7 +535,51 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print(
                     f"Dropped {removed_outliers} rows with adr above {upper_bound} before training."
                 )
-    del probe_pipeline
+    del base_pipeline
+
+    tuned_params: Dict[str, Any] = {}
+    search_metadata: Dict[str, Any] | None = None
+    if args.search:
+        param_distributions = get_param_distributions(args.model)
+        if not param_distributions:
+            print(
+                f"No hyperparameter search space configured for model '{args.model}'. Skipping search."
+            )
+        else:
+            search_cv_splits = args.search_n_splits or args.n_splits
+            search_pipeline = build_pipeline(
+                random_state=args.random_state,
+                model_type=args.model,
+            )
+            sample_weight_full = compute_sample_weight(
+                class_weight="balanced",
+                y=y,
+            )
+            search_metadata = run_hyperparameter_search(
+                estimator=search_pipeline,
+                param_distributions=param_distributions,
+                X=X,
+                y=y,
+                n_iter=args.search_iterations,
+                cv_splits=search_cv_splits,
+                random_state=args.random_state,
+                n_jobs=args.search_n_jobs,
+                sample_weight=sample_weight_full,
+            )
+            tuned_params = search_metadata["best_params"]
+            print("Hyperparameter search results:")
+            print(f"  Best mean CV f1_weighted: {search_metadata['best_score']:.4f}")
+            for param_name, value in sorted(tuned_params.items()):
+                print(f"  {param_name} = {value}")
+
+    def pipeline_builder() -> Pipeline:
+        pipeline = build_pipeline(
+            random_state=args.random_state,
+            model_type=args.model,
+        )
+        if tuned_params:
+            pipeline.set_params(**tuned_params)
+        return pipeline
 
     metrics = run_cross_validation(
         pipeline_builder,
@@ -454,6 +590,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     metrics["model_type"] = args.model
     metrics["n_splits"] = args.n_splits
+    if search_metadata is not None:
+        search_cv_splits = args.search_n_splits or args.n_splits
+        metrics["hyperparameter_search"] = {
+            "best_params": search_metadata["best_params"],
+            "best_score": search_metadata["best_score"],
+            "n_iter": args.search_iterations,
+            "n_splits": search_cv_splits,
+        }
 
     print(f"Model type: {args.model}")
     print("Cross-validation results:")
