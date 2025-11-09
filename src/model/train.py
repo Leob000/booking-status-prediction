@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Sequence
 import joblib
 import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from pandas.api.types import CategoricalDtype
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.compose import ColumnTransformer, make_column_selector
@@ -21,18 +22,19 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
+from src.model.data_processing import DataFrameTransformer
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from catboost import CatBoostClassifier
-
-from src.model.data_processing import DataFrameTransformer
 
 DEFAULT_TARGET_COLUMN = "reservation_status"
 DEFAULT_DATA_PATH = Path("src/data/train_data.csv")
+DEFAULT_TEST_PATH = Path("src/data/test_data.csv")
 DEFAULT_MODEL_PATH = Path("models/booking_status_pipeline.joblib")
 DEFAULT_METRICS_PATH = Path("artifacts/training_metrics.json")
+DEFAULT_PREDICTIONS_PATH = Path("artifacts/test_predictions.csv")
 
 
 def _json_default(value: Any) -> Any:
@@ -439,6 +441,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Name of the target column (default: {DEFAULT_TARGET_COLUMN})",
     )
     parser.add_argument(
+        "--test-path",
+        type=Path,
+        default=DEFAULT_TEST_PATH,
+        help=f"Path to the test data CSV (default: {DEFAULT_TEST_PATH})",
+    )
+    parser.add_argument(
         "--n-splits",
         type=int,
         default=5,
@@ -492,6 +500,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Where to persist the trained pipeline (default: {DEFAULT_MODEL_PATH}).",
     )
     parser.add_argument(
+        "--predictions-path",
+        type=Path,
+        default=DEFAULT_PREDICTIONS_PATH,
+        help=(
+            "Where to persist the final test predictions CSV "
+            f"(default: {DEFAULT_PREDICTIONS_PATH})."
+        ),
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="Skip persisting the trained pipeline and metrics to disk.",
@@ -504,6 +521,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if not args.data_path.exists():
         raise FileNotFoundError(f"Training data not found at {args.data_path}")
+    if not args.test_path.exists():
+        raise FileNotFoundError(f"Test data not found at {args.test_path}")
 
     df = pd.read_csv(args.data_path)
     if args.target_column not in df.columns:
@@ -610,6 +629,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"  Overall (OOF) F1_weighted: {metrics['overall_f1_weighted']:.4f}")
 
     pipeline = train_final_model(pipeline_builder, X, y)
+
+    test_df = pd.read_csv(args.test_path)
+    if "row_id" not in test_df.columns:
+        raise ValueError(
+            f"Test data at {args.test_path} must contain a 'row_id' column."
+        )
+
+    test_features = test_df.copy()
+    pipeline_features = pipeline.named_steps.get("features")
+    if (
+        isinstance(pipeline_features, DataFrameTransformer)
+        and getattr(pipeline_features, "drop_adr_outliers", False)
+        and "adr" in test_features.columns
+    ):
+        upper_bound = getattr(pipeline_features, "adr_upper_bound", None)
+        if upper_bound is not None:
+            adr_numeric = pd.to_numeric(test_features["adr"], errors="coerce")
+            exceeds_mask = adr_numeric > upper_bound
+            if exceeds_mask.any():
+                exceed_count = int(exceeds_mask.sum())
+                print(
+                    f"Clipping {exceed_count} test rows with adr above {upper_bound} to keep them for prediction."
+                )
+                test_features.loc[exceeds_mask, "adr"] = upper_bound
+
+    test_predictions = pipeline.predict(test_features)
+    if len(test_predictions) != len(test_df):
+        raise RuntimeError(
+            "Prediction count does not match the number of test rows. "
+            "This may be caused by rows dropped during feature transformation."
+        )
+
+    predictions_df = pd.DataFrame(
+        {
+            "row_id": test_df["row_id"].astype(int),
+            "reservation_status": test_predictions.astype(int),
+        }
+    )
+
+    ensure_directory(args.predictions_path)
+    predictions_df.to_csv(args.predictions_path, index=False)
+    print(f"Saved test predictions to {args.predictions_path}")
 
     if not args.no_save:
         ensure_directory(args.model_path)

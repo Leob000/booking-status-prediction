@@ -1,5 +1,6 @@
 data/
 my/
+artifacts/
 
 # python / jupyter
 .ipynb_checkpoints
